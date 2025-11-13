@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # ===============================================
-# bootstrap.sh — Version 0.7 (WSL AI + CUDA + WebUI)
+# bootstrap.sh — Version 0.8 (WSL AI + Ollama + WebUI)
 # -----------------------------------------------
 # Author: Kevin Price
 # Purpose:
-#     Configure a WSL Ubuntu environment for GPU-enabled
-#     AI and development workloads without installing Linux GPU drivers.
+#     Configure a WSL Ubuntu environment for running
+#     Ollama and other LLMs with GPU support (WSL-safe)
 #
 # Changelog:
-#   v0.7 - Fixed CUDA Nsight dependency (libtinfo5),
-#          fixed OpenWebUI typing_extensions conflict,
-#          added detailed pause messages per section.
+#   v0.8 - Minimal CUDA runtime only, no dev toolkit
+#          Fixed OpenWebUI typing_extensions issue
+#          Added detailed pause messages per section
 # ===============================================
 
 LOGFILE="$HOME/bootstrap.log"
@@ -24,7 +24,7 @@ pause() {
     fi
 }
 
-echo "=== Starting Bootstrap Script v0.7 ==="
+echo "=== Starting Bootstrap Script v0.8 ==="
 echo "Timestamp: $(date)"
 echo "Logfile: $LOGFILE"
 echo "====================================="
@@ -63,25 +63,18 @@ grep -q "nvidia-smi" ~/.bashrc || \
 echo 'nvidia-smi --query-gpu=name,memory.total,memory.used,utilization.gpu --format=csv,noheader' >> ~/.bashrc
 
 ##############################################
-# [3/10] Install CUDA Toolkit (WSL-safe)
+# [3/10] Install WSL-safe CUDA runtime only
 ##############################################
-echo "[3/10] Installing NVIDIA CUDA toolkit (WSL-safe)..."
+echo "[3/10] Installing NVIDIA CUDA runtime libraries (WSL-safe)..."
 pause
-apt-get install -y wget gnupg software-properties-common libtinfo6 || true
-
-# Fix missing libtinfo5 dependency (for Nsight)
-if ! dpkg -s libtinfo5 >/dev/null 2>&1; then
-    echo "[INFO] Applying libtinfo5 compatibility fix..."
-    apt-get install -y libncurses5
-    ln -sf /lib/x86_64-linux-gnu/libncurses.so.5 /lib/x86_64-linux-gnu/libtinfo.so.5 2>/dev/null || true
-fi
+apt-get install -y wget gnupg software-properties-common libtinfo6
 
 CUDA_REPO="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/"
 wget -q ${CUDA_REPO}/cuda-keyring_1.1-1_all.deb -O /tmp/cuda-keyring.deb
 dpkg -i /tmp/cuda-keyring.deb
 apt-get update -y
 
-apt-get install -y cuda-toolkit-12-4 || echo "[WARN] CUDA installation encountered issues — continuing..."
+apt-get install -y cuda-runtime-12-4
 
 grep -q "/usr/local/cuda/bin" ~/.bashrc || echo 'export PATH=$PATH:/usr/local/cuda/bin' >> ~/.bashrc
 export PATH=$PATH:/usr/local/cuda/bin

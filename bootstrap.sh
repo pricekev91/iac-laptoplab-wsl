@@ -37,10 +37,19 @@ echo "[1/11] Updating system..."
 apt-get update -y && apt-get upgrade -y
 
 ##############################################
-# [2/11] Install utilities
+# [2/11] Install Fastfetch from GitHub
 ##############################################
-echo "[2/11] Installing utilities..."
-apt-get install -y fastfetch btop git curl wget gnupg software-properties-common python3 python3-pip
+echo "[2/11] Installing Fastfetch from official GitHub..."
+apt-get install -y git cmake gcc g++ pkg-config libwayland-dev libx11-dev libxrandr-dev libxi-dev libxinerama-dev libxft-dev
+
+git clone --depth=1 https://github.com/fastfetch-cli/fastfetch.git /tmp/fastfetch
+cd /tmp/fastfetch
+mkdir build && cd build
+cmake ..
+make -j$(nproc)
+make install
+
+grep -q "fastfetch" ~/.bashrc || echo "fastfetch" >> ~/.bashrc
 
 ##############################################
 # [3/11] Install CUDA runtime
@@ -65,9 +74,10 @@ else
 fi
 
 ##############################################
-# [5/11] Install PyTorch + HuggingFace
+# [5/11] Install Python, PyTorch, HuggingFace
 ##############################################
-echo "[5/11] Installing PyTorch & HuggingFace..."
+echo "[5/11] Installing Python & AI libraries..."
+apt-get install -y python3 python3-pip
 pip install --break-system-packages torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 pip install --break-system-packages transformers accelerate sentencepiece
 

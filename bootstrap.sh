@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # ===============================================
-# bootstrap.sh — Version 1.1 (WSL AI + Ollama + WebUI + systemd)
+# bootstrap.sh — Version 1.2 (WSL AI + Ollama + WebUI + systemd)
 # -----------------------------------------------
 # Author: Kevin Price (Final)
 # Purpose:
 #     Configure WSL Ubuntu for Ollama + OpenWebUI with GPU support
-#     Enable systemd, create services, pull DeepSeek-R1:1.5b reliably
+#     Install OpenWebUI via official installer (NOT pip)
 # ===============================================
 
 LOGFILE="$HOME/bootstrap.log"
 exec > >(tee -a "$LOGFILE") 2>&1
 set -e
 
-echo "=== Starting Bootstrap Script v1.1 ==="
+echo "=== Starting Bootstrap Script v1.2 ==="
 echo "Timestamp: $(date)"
 echo "Logfile: $LOGFILE"
 echo "====================================="
@@ -28,7 +28,7 @@ default=root
 [boot]
 systemd=true
 EOF
-echo "✅ systemd enabled. Run 'wsl --shutdown' after script completes."
+echo "✅ systemd enabled. Restart WSL after script completes."
 
 ##############################################
 # [1/12] Update & Upgrade System
@@ -39,16 +39,14 @@ apt-get update -y && apt-get upgrade -y
 ##############################################
 # [2/12] Install Fastfetch from GitHub
 ##############################################
-echo "[2/12] Installing Fastfetch from official GitHub..."
+echo "[2/12] Installing Fastfetch from GitHub..."
 apt-get install -y git cmake gcc g++ pkg-config libwayland-dev libx11-dev libxrandr-dev libxi-dev libxinerama-dev libxft-dev
-
 git clone --depth=1 https://github.com/fastfetch-cli/fastfetch.git /tmp/fastfetch
 cd /tmp/fastfetch
 mkdir build && cd build
 cmake ..
 make -j$(nproc)
 make install
-
 grep -q "fastfetch" ~/.bashrc || echo "fastfetch" >> ~/.bashrc
 
 ##############################################
@@ -70,13 +68,13 @@ echo "[4/12] Checking GPU..."
 if command -v nvidia-smi &>/dev/null; then
     nvidia-smi
 else
-    echo "⚠️ nvidia-smi not found (expected in WSL if driver is on Windows)."
+    echo "⚠️ nvidia-smi not found (expected if driver is only present on Windows)."
 fi
 
 ##############################################
-# [5/12] Install Python, PyTorch, HuggingFace
+# [5/12] Install Python + AI libs
 ##############################################
-echo "[5/12] Installing Python & AI libraries..."
+echo "[5/12] Installing Python & AI libs..."
 apt-get install -y python3 python3-pip
 pip install --break-system-packages torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 pip install --break-system-packages transformers accelerate sentencepiece
@@ -90,25 +88,16 @@ export OLLAMA_HOME="$HOME/.ollama"
 echo 'export OLLAMA_HOME="$HOME/.ollama"' >> ~/.bashrc
 
 ##############################################
-# [7/12] Wait for Ollama API before pulling model
+# [7/12] Pre-pull default model
 ##############################################
-echo "[7/12] Starting Ollama temporarily to pull model..."
-nohup ollama serve > /var/log/ollama.log 2>&1 &
-echo "Waiting for Ollama API to be ready..."
-until curl -s http://localhost:11434/api/tags >/dev/null; do
-    sleep 2
-done
-echo "✅ Ollama API is ready."
-
-echo "Pulling default model (deepseek-r1:1.5b)..."
+echo "[7/12] Pulling default model deepseek-r1:1.5b ..."
 ollama pull deepseek-r1:1.5b
-pkill -f "ollama serve"  # Stop temporary instance
 
 ##############################################
-# [8/12] Install OpenWebUI
+# [8/12] Install OpenWebUI (OFFICIAL installer)
 ##############################################
-echo "[8/12] Installing OpenWebUI..."
-pip install --break-system-packages --ignore-installed open-webui
+echo "[8/12] Installing OpenWebUI using official installer..."
+curl -fsSL https://raw.githubusercontent.com/open-webui/open-webui/main/install.sh | bash
 
 ##############################################
 # [9/12] Create systemd service for Ollama
@@ -121,7 +110,6 @@ After=network.target
 
 [Service]
 ExecStart=/usr/local/bin/ollama serve
-ExecStartPost=/usr/local/bin/ollama pull deepseek-r1:1.5b
 Restart=always
 User=root
 Environment=OLLAMA_HOME=/root/.ollama
@@ -131,29 +119,16 @@ WantedBy=multi-user.target
 EOF
 
 ##############################################
-# [10/12] Create systemd service for OpenWebUI
+# [10/12] Enable OpenWebUI service (already installed)
 ##############################################
-echo "[10/12] Creating OpenWebUI systemd service..."
-cat << 'EOF' | sudo tee /etc/systemd/system/openwebui.service > /dev/null
-[Unit]
-Description=OpenWebUI Service
-After=ollama.service
-
-[Service]
-ExecStart=/usr/local/bin/open-webui serve --host 0.0.0.0 --port 8080 --ollama-base-url http://localhost:11434
-Restart=always
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
+echo "[10/12] Enabling OpenWebUI service..."
+systemctl enable openwebui
 
 ##############################################
 # [11/12] Enable and start services
 ##############################################
-echo "[11/12] Enabling and starting services..."
+echo "[11/12] Starting services..."
 systemctl enable ollama.service
-systemctl enable openwebui.service
 systemctl start ollama.service
 systemctl start openwebui.service
 
@@ -168,9 +143,7 @@ apt-get autoremove -y && apt-get clean
 ##############################################
 echo "==============================================="
 echo "✅ Bootstrap Completed Successfully!"
-echo "✅ systemd enabled (restart WSL with 'wsl --shutdown')"
-echo "✅ Ollama + OpenWebUI running as services"
-echo "✅ Default model: deepseek-r1:1.5b"
-echo "✅ Access OpenWebUI at: http://<your-ip>:8080"
-echo "✅ Check status: systemctl status ollama.service | openwebui.service"
+echo "Restart WSL using:   wsl --shutdown"
+echo "Ollama running at:   http://localhost:11434"
+echo "OpenWebUI running at http://<your-ip>:8080"
 echo "==============================================="

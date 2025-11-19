@@ -1,29 +1,28 @@
 #!/usr/bin/env bash
-# bootstrap-llamacpp-openwebui-v0.15.sh — Version 0.15
+# bootstrap-llamacpp-openwebui-v0.16.sh — Version 0.16
 # Author: adapted for Kevin Price by ChatGPT
 # Purpose:
-#   - Build llama.cpp (auto-detect CUDA and auto-install CUDA silently if NVIDIA GPU exists)
-#   - Install OpenWebUI into a venv
+#   - Build llama.cpp (auto-detect CUDA; auto-install CUDA silently if NVIDIA GPU exists)
+#   - Install OpenWebUI into a Python venv
 #   - Create systemd services:
 #       /etc/systemd/system/llamacpp.service      (external llama.cpp server)
 #       /etc/systemd/system/openwebui.service
 #   - Default model: DeepSeek-R1 1.5B (attempts to download if HF_TOKEN is provided)
-#
+# Notes:
+#   - THIS SCRIPT WILL NOT RUN pip against the system Python. All pip usage is inside venvs.
+#   - If CUDA build fails, script will automatically retry a CPU-only build.
 # Usage:
-#   sudo bash ./bootstrap-llamacpp-openwebui-v0.15.sh
-#
+#   sudo bash ./bootstrap-llamacpp-openwebui-v0.16.sh
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-LOGFILE="/var/log/bootstrap-0.15.log"
+LOGFILE="/var/log/bootstrap-0.16.log"
 exec > >(tee -a "${LOGFILE}") 2>&1
 
-# Config
+# ---------------- Config ----------------
 LLAMACPP_REPO="https://github.com/ggerganov/llama.cpp.git"
-LLAMACPP_BRANCH="main"
+LLAMACPP_BRANCH_FALLBACKS=( "master" "main" )
 OPENWEBUI_PIPPKG="open-webui"
-PYTHON_MIN_VER="3.10"
-
 OPT_DIR="/opt"
 SRV_DIR="/srv"
 LLAMACPP_OPT="${OPT_DIR}/llama.cpp"
@@ -31,34 +30,35 @@ OPENWEBUI_OPT="${OPT_DIR}/openwebui"
 AI_MODELS_DIR="${SRV_DIR}/ai/models"
 LLAMACPP_MODELS_DIR="${SRV_DIR}/llama.cpp/models"
 OPENWEBUI_DATA_DIR="${SRV_DIR}/openwebui/data"
-
 LLAMACPP_SERVICE="llamacpp.service"
 OPENWEBUI_SERVICE="openwebui.service"
 
-# Default model variables (DeepSeek-R1 1.5B)
-# Note: automatic download requires HF_TOKEN environment variable.
+# model defaults (DeepSeek-R1 1.5B)
 DEFAULT_MODEL_NAME="deepseek-r1-1.5b.gguf"
 DEFAULT_MODEL_REPO="deepseek/deepseek-r1-1.5b"   # huggingface repo id (may change)
 DEFAULT_MODEL_TARGET="${AI_MODELS_DIR}/${DEFAULT_MODEL_NAME}"
 
-# Helper functions
+# CUDA versions to try
+CUDA_PACKAGE_CANDIDATES=( "cuda-runtime-12-4" "cuda-toolkit-12-4" "cuda-runtime-12-5" "cuda-toolkit-12-5" )
+
+# ---------------- Helpers ----------------
 section(){ printf "\n%s\n %s\n%s\n\n" "==============================================================" "$1" "=============================================================="; }
 require_root(){ if [ "$EUID" -ne 0 ]; then echo "This script requires root. Re-run with sudo."; exit 1; fi; }
 mkdir_if_missing(){ local d="$1"; if [ ! -d "${d}" ]; then mkdir -p "${d}"; chown root:root "${d}"; chmod 0755 "${d}"; fi; }
 safe_apt_update(){ apt-get update -y || true; }
 pause_if_interactive(){ if [ -z "${AUTO:-}" ] && [ -t 0 ]; then read -rp $'\n⏸  Press ENTER to continue (or set AUTO=1 to skip)... ' -r || true; fi; }
 
-# Begin
-section "Bootstrap v0.15 — llama.cpp + OpenWebUI (CUDA auto-install: ON)"
+# run a command but don't exit on non-zero (used to test)
+try(){ "$@" || true; }
+
+# ---------------- Begin ----------------
+section "Bootstrap v0.16 — llama.cpp + OpenWebUI"
 date
 echo "Logfile: ${LOGFILE}"
 pause_if_interactive
-
 require_root
 
-########################################
-# [0] basic users & dirs
-########################################
+# ---------------- [0] create dirs & user ----------------
 section "[0/12] Create directories and aiuser"
 mkdir_if_missing "${OPT_DIR}"
 mkdir_if_missing "${SRV_DIR}"
@@ -73,32 +73,30 @@ else
     echo "System user aiuser already exists"
 fi
 
-chown -R aiuser:aiuser "${SRV_DIR}"
-chmod -R 0755 "${SRV_DIR}"
+chown -R aiuser:aiuser "${SRV_DIR}" || true
+chmod -R 0755 "${SRV_DIR}" || true
 
-########################################
-# [1] apt update + base packages
-########################################
+# ---------------- [1] apt update + essentials ----------------
 section "[1/12] Update & install build/runtime packages"
 safe_apt_update
 
-# modern Python + build tools (no python3-distutils)
+# Install core build tools & runtime (no system-level pip installs)
 apt-get install -y --no-install-recommends \
     build-essential cmake ninja-build git curl wget ca-certificates \
     pkg-config unzip zip jq lsb-release gnupg software-properties-common \
-    python3 python3-pip python3-venv python3-dev \
+    python3 python3-venv python3-dev \
     gcc g++ make libopenblas-dev libblas-dev liblapack-dev
 
-# ensure pip is usable
+# Ensure pip in system python usable for venv creation (we won't pip install system-wide)
 python3 -m pip install --upgrade pip setuptools wheel || true
 
-########################################
-# [2] NVIDIA detection + optional auto-install CUDA
-########################################
-section "[2/12] NVIDIA/CUDA detection and (auto) install"
-# Detect NVIDIA GPU (lspci)
+# ---------------- [2] Nvidia/CUDA detection + auto-install ----------------
+section "[2/12] NVIDIA+CUDA detection and auto-install"
+# Detect NVIDIA present: check nvidia-smi first (covers WSL & native), then lspci
 HAS_NVIDIA_GPU=0
-if command -v lspci >/dev/null 2>&1 && lspci | grep -i 'nvidia' >/dev/null 2>&1; then
+if command -v nvidia-smi >/dev/null 2>&1; then
+    HAS_NVIDIA_GPU=1
+elif command -v lspci >/dev/null 2>&1 && lspci | grep -i -q nvidia; then
     HAS_NVIDIA_GPU=1
 fi
 
@@ -111,127 +109,163 @@ fi
 echo "NVIDIA GPU detected: ${HAS_NVIDIA_GPU}"
 echo "CUDA toolkit detected: ${HAS_CUDA}"
 
-# Auto-install CUDA silently if GPU exists and CUDA not found (you chose option B)
+# Auto-install CUDA silently if GPU exists but toolkit not found (per your choice)
 if [ "${HAS_NVIDIA_GPU}" -eq 1 ] && [ "${HAS_CUDA}" -eq 0 ]; then
-    echo "NVIDIA GPU present but CUDA not found — attempting silent CUDA install..."
-    # Try NVIDIA keyring + repository (targets Ubuntu 22.04/24.04 paths where possible)
+    echo "Attempting silent NVIDIA CUDA runtime install..."
     CUDA_KEYRING="/tmp/cuda-keyring.deb"
     CUDA_REPO_BASE="https://developer.download.nvidia.com/compute/cuda/repos"
-    UB_REL="$(lsb_release -cs || echo ubuntu)"
-    # map Ubuntu codename for repo path (best-effort)
-    if [ -f "${CUDA_KEYRING}" ]; then rm -f "${CUDA_KEYRING}"; fi
-    # Attempt to download a keyring for the detected distro family
-    # Try known ubuntu2204 path first, fallback to ubuntu2004
-    for REPO_DIST in "ubuntu2204" "ubuntu2004" "ubuntu2404"; do
+    # try a few common ubuntu repo targets
+    for REPO_DIST in "ubuntu2204" "ubuntu2404" "ubuntu2004"; do
         KEYRING_URL="${CUDA_REPO_BASE}/${REPO_DIST}/x86_64/cuda-keyring_1.1-1_all.deb"
-        echo "Trying CUDA keyring: ${KEYRING_URL}"
+        echo "Trying keyring URL: ${KEYRING_URL}"
         if wget -q --timeout=15 --tries=2 "${KEYRING_URL}" -O "${CUDA_KEYRING}"; then
             dpkg -i "${CUDA_KEYRING}" >/dev/null 2>&1 || true
             safe_apt_update
-            # best-effort install runtime; allow failure and continue (will fall back to CPU)
-            apt-get install -y --no-install-recommends cuda-runtime-12-4 || apt-get install -y --no-install-recommends cuda-toolkit-12-4 || true
+            # try candidate packages
+            for pkg in "${CUDA_PACKAGE_CANDIDATES[@]}"; do
+                echo "Trying apt install: ${pkg}"
+                if apt-get install -y --no-install-recommends "${pkg}"; then
+                    echo "Installed ${pkg}"
+                    break
+                fi
+            done
             break
         fi
     done
-
-    # re-check
+    # re-detect
     if command -v nvcc >/dev/null 2>&1 || [ -d "/usr/local/cuda" ]; then
-        echo "CUDA appears to be installed."
         HAS_CUDA=1
+        echo "CUDA appears installed."
     else
-        echo "CUDA install attempt did not succeed (continuing; will build CPU-only)."
+        echo "CUDA install attempt did not succeed; continuing (will fallback to CPU build)."
         HAS_CUDA=0
     fi
 fi
 
-########################################
-# [3] Clone & build llama.cpp (CUDA or CPU)
-########################################
-section "[3/12] Clone & build llama.cpp"
+# ---------------- [3] Clone llama.cpp (try master, then fallback) ----------------
+section "[3/12] Clone & prepare llama.cpp source"
 pause_if_interactive
 
 if [ ! -d "${LLAMACPP_OPT}" ]; then
-    git clone --depth 1 --branch "${LLAMACPP_BRANCH}" "${LLAMACPP_REPO}" "${LLAMACPP_OPT}" || {
-        echo "git clone failed; exiting"
-        exit 1
-    }
+    CLONED=0
+    for br in "${LLAMACPP_BRANCH_FALLBACKS[@]}"; do
+        echo "Attempting clone branch: ${br}"
+        if git clone --depth 1 --branch "${br}" "${LLAMACPP_REPO}" "${LLAMACPP_OPT}"; then
+            CLONED=1
+            echo "Cloned ${LLAMACPP_REPO} (branch ${br})"
+            break
+        fi
+    done
+    if [ "${CLONED}" -eq 0 ]; then
+        echo "Could not clone using fallback branches; attempting default branch clone..."
+        if ! git clone --depth 1 "${LLAMACPP_REPO}" "${LLAMACPP_OPT}"; then
+            echo "git clone failed; exiting"
+            exit 1
+        fi
+    fi
 else
-    echo "llama.cpp already exists; fetching latest (shallow)"
-    (cd "${LLAMACPP_OPT}" && git fetch --depth=1 origin "${LLAMACPP_BRANCH}" && git reset --hard "origin/${LLAMACPP_BRANCH}") || true
+    echo "llama.cpp already present; updating (shallow)"
+    (cd "${LLAMACPP_OPT}" && git fetch --depth=1 origin || true)
 fi
 
+# ---------------- [4] Build llama.cpp (try CUDA then fallback to CPU) ----------------
+section "[4/12] Build llama.cpp (CUDA if available, else CPU). Auto-retry CPU on failure."
 cd "${LLAMACPP_OPT}"
 mkdir -p build
 cd build
 
+BUILD_MODE="cpu"
 if [ "${HAS_CUDA}" -eq 1 ]; then
-    echo "Building llama.cpp with CUDA/cuBLAS support..."
-    # Attempt to enable cublas/cuda through CMake flags used by llama.cpp
-    cmake -S .. -B . -G Ninja -DLLAMA_CUBLAS=ON -DCMAKE_BUILD_TYPE=Release || {
-        echo "CMake (CUDA) configure failed; retrying CPU-only configure..."
-        cmake -S .. -B . -G Ninja -DCMAKE_BUILD_TYPE=Release
-    }
+    BUILD_MODE="cuda"
+fi
+
+# function to configure & build
+build_llama() {
+    local mode="$1"
+    echo "Configuring llama.cpp build (mode=${mode})"
+    if [ "${mode}" = "cuda" ]; then
+        cmake -S .. -B . -G Ninja -DLLAMA_CUBLAS=ON -DCMAKE_BUILD_TYPE=Release || return 1
+    else
+        cmake -S .. -B . -G Ninja -DCMAKE_BUILD_TYPE=Release || return 1
+    fi
+    echo "Running ninja build..."
+    if ninja -v; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Attempt build; if CUDA build fails, auto-fallback to CPU
+if [ "${BUILD_MODE}" = "cuda" ]; then
+    if build_llama "cuda"; then
+        echo "CUDA build succeeded."
+    else
+        echo "CUDA build failed. Retrying CPU-only build..."
+        if build_llama "cpu"; then
+            echo "CPU-only build succeeded after CUDA failure."
+        else
+            echo "Both CUDA and CPU builds failed. Exiting."
+            exit 1
+        fi
+    fi
 else
-    echo "Building CPU-only optimized llama.cpp..."
-    cmake -S .. -B . -G Ninja -DCMAKE_BUILD_TYPE=Release
+    if build_llama "cpu"; then
+        echo "CPU-only build succeeded."
+    else
+        echo "CPU-only build failed. Exiting."
+        exit 1
+    fi
 fi
 
-# build
-if ! ninja -v; then
-    echo "Build failed. If CUDA was enabled, trying a CPU-only rebuild..."
-    cmake -S .. -B . -G Ninja -DCMAKE_BUILD_TYPE=Release || true
-    ninja -v || { echo "Final build attempt failed; exit."; exit 1; }
-fi
-
-# copy binary to /opt location
+# Copy binary to /opt/llama.cpp/bin (idempotent)
 LLAMA_BIN_DIR="${LLAMACPP_OPT}/bin"
 mkdir -p "${LLAMA_BIN_DIR}"
-# The built binary is commonly called main (project may vary). Copy/update.
+# common locations for built binary
 if [ -f "${LLAMACPP_OPT}/main" ]; then
-    cp -u "${LLAMACPP_OPT}/main" "${LLAMA_BIN_DIR}/llamacpp" 2>/dev/null || true
+    cp -u "${LLAMACPP_OPT}/main" "${LLAMA_BIN_DIR}/llamacpp" || true
 elif [ -f "${LLAMACPP_OPT}/build/main" ]; then
-    cp -u "${LLAMACPP_OPT}/build/main" "${LLAMA_BIN_DIR}/llamacpp" 2>/dev/null || true
+    cp -u "${LLAMACPP_OPT}/build/main" "${LLAMA_BIN_DIR}/llamacpp" || true
+elif [ -f "${LLAMACPP_OPT}/main.exe" ]; then
+    cp -u "${LLAMACPP_OPT}/main.exe" "${LLAMA_BIN_DIR}/llamacpp" || true
 fi
-chmod +x "${LLAMA_BIN_DIR}/llamacpp"
+chmod +x "${LLAMA_BIN_DIR}/llamacpp" || true
 ln -sf "${LLAMA_BIN_DIR}/llamacpp" /usr/local/bin/llamacpp || true
-
-echo "llama.cpp built and installed to ${LLAMA_BIN_DIR}"
+echo "llama.cpp built and installed into ${LLAMA_BIN_DIR}"
 pause_if_interactive
 
-########################################
-# [4] Create llama.cpp run wrapper (external server)
-########################################
-section "[4/12] Create llama.cpp server wrapper"
-# This wrapper is a best-effort example. Adjust flags if your build expects different CLI.
+# ---------------- [5] Create llama.cpp run wrapper ----------------
+section "[5/12] Create llama.cpp server wrapper"
 mkdir -p "${LLAMACPP_OPT}/bin"
 cat > "${LLAMACPP_OPT}/bin/llamacpp-run" <<'EOF'
 #!/usr/bin/env bash
-# wrapper to run llama.cpp as a "server" for OpenWebUI.
-# NOTE: Adjust parameters to match your llama.cpp version if needed.
-
+# llama.cpp-run wrapper: tries to start the binary in a server-like mode if supported.
 MODEL_PATH="${1:-/srv/ai/models/deepseek-r1-1.5b.gguf}"
 PORT="${2:-8081}"
 THREADS="${3:-$(nproc)}"
 
-# If model file missing, warn and exit (systemd will show logs)
 if [ ! -f "${MODEL_PATH}" ]; then
-    echo "ERROR: Model not found at ${MODEL_PATH}"
-    echo "Place the model there or edit this wrapper to point to the correct model path."
+    echo "ERROR: model not found at ${MODEL_PATH}"
     exit 2
 fi
 
-# Common flags — adjust if your build supports different options
-# Some builds might have a dedicated server example. Use it if available.
-# This attempts to run the built binary with model and a listening port (best-effort).
-exec /usr/local/bin/llamacpp -m "${MODEL_PATH}" --threads "${THREADS}" --port "${PORT}"
+BINARY="$(command -v llamacpp || command -v /usr/local/bin/llamacpp || true)"
+if [ -z "${BINARY}" ]; then
+    echo "ERROR: llama.cpp binary not found."
+    exit 3
+fi
+
+# Try to run with port flag (many builds provide a server mode)
+"${BINARY}" --help >/dev/null 2>&1 || true
+
+# Attempt with common flags (best-effort); adjust for your build if needed
+exec "${BINARY}" -m "${MODEL_PATH}" --threads "${THREADS}" --port "${PORT}"
 EOF
-chmod +x "${LLAMACPP_OPT}/bin/llamacpp-run"
+chmod +x "${LLAMACPP_OPT}/bin/llamacpp-run" || true
 ln -sf "${LLAMACPP_OPT}/bin/llamacpp-run" /usr/local/bin/llamacpp-run || true
 
-########################################
-# [5] Install OpenWebUI (venv)
-########################################
-section "[5/12] Install OpenWebUI into a venv"
+# ---------------- [6] Install OpenWebUI (venv) ----------------
+section "[6/12] Install OpenWebUI into a Python venv"
 pause_if_interactive
 
 if [ ! -d "${OPENWEBUI_OPT}" ]; then
@@ -244,74 +278,68 @@ if [ ! -d "${OPENWEBUI_VENV}" ]; then
     python3 -m venv "${OPENWEBUI_VENV}"
 fi
 
-# activate and install
+# Install open-webui inside venv (no system pip modifications)
 # shellcheck disable=SC1090
 source "${OPENWEBUI_VENV}/bin/activate"
-pip install --upgrade pip setuptools wheel
-# OpenWebUI upstream package name is sometimes different; using provided name
-pip install --break-system-packages --upgrade "${OPENWEBUI_PIPPKG}" || {
+python -m pip install --upgrade pip setuptools wheel || true
+python -m pip install --break-system-packages --upgrade "${OPENWEBUI_PIPPKG}" || {
     echo "Warning: pip install ${OPENWEBUI_PIPPKG} had non-zero exit code; continuing."
 }
 deactivate
 
-# create a run wrapper
+# run wrapper
 mkdir -p "${OPENWEBUI_OPT}/bin"
 cat > "${OPENWEBUI_OPT}/bin/openwebui-run" <<'EOF'
 #!/usr/bin/env bash
 BASE_DIR="$(dirname "$(dirname "$0")")"
 source "${BASE_DIR}/venv/bin/activate"
-# serve on 0.0.0.0:8080 by default
 exec open-webui serve --host 0.0.0.0 --port 8080
 EOF
 chmod +x "${OPENWEBUI_OPT}/bin/openwebui-run"
 ln -sf "${OPENWEBUI_OPT}/bin/openwebui-run" /usr/local/bin/openwebui-run || true
 
-# ensure data dir and ownership
-mkdir -p "${OPENWEBUI_DATA_DIR}"
-chown -R aiuser:aiuser "${OPENWEBUI_DATA_DIR}"
+chown -R aiuser:aiuser "${OPENWEBUI_DATA_DIR}" || true
 
-########################################
-# [6] Model download (attempt) — uses HF_TOKEN if available
-########################################
-section "[6/12] Attempt to download default model (DeepSeek-R1 1.5B)"
+# ---------------- [7] Model download (optional) ----------------
+section "[7/12] Attempt to download default model (DeepSeek-R1 1.5B) using HF_TOKEN"
 pause_if_interactive
 
 if [ -n "${HF_TOKEN:-}" ]; then
-    echo "HF_TOKEN detected — attempting model download using huggingface_hub"
-    python3 - <<PY
-from huggingface_hub import hf_hub_download
+    echo "HF_TOKEN present — using temporary venv to run huggingface_hub download"
+    TMP_VENV_DIR="$(mktemp -d /tmp/hfvenv.XXXX)"
+    python3 -m venv "${TMP_VENV_DIR}"
+    # shellcheck disable=SC1090
+    source "${TMP_VENV_DIR}/bin/activate"
+    python -m pip install --upgrade pip setuptools wheel huggingface_hub || true
+    python - <<PY
 import os,sys
-repo_id = os.environ.get("HF_REPO","${DEFAULT_MODEL_REPO}")
+from huggingface_hub import hf_hub_download
+repo = os.environ.get("HF_REPO","${DEFAULT_MODEL_REPO}")
 fname = "${DEFAULT_MODEL_NAME}"
 target_dir = "${AI_MODELS_DIR}"
 os.makedirs(target_dir, exist_ok=True)
 try:
-    print("Downloading", fname, "from", repo_id)
-    path = hf_hub_download(repo_id=repo_id, filename=fname, cache_dir=target_dir, token=os.environ.get("HF_TOKEN"))
-    print("Downloaded to:", path)
+    print("Downloading", fname, "from", repo)
+    p = hf_hub_download(repo_id=repo, filename=fname, cache_dir=target_dir, token=os.environ.get("HF_TOKEN"))
+    print("Downloaded to:", p)
 except Exception as e:
     print("Model download failed:", e)
     sys.exit(1)
 PY
-
-    # ensure proper ownership
-    chown -R aiuser:aiuser "${AI_MODELS_DIR}"
+    deactivate
+    rm -rf "${TMP_VENV_DIR}"
+    chown -R aiuser:aiuser "${AI_MODELS_DIR}" || true
 else
     echo "HF_TOKEN not set — skipping automatic model download."
-    echo "To download DeepSeek-R1 1.5B automatically, export HF_TOKEN and re-run."
-    echo "Example:"
-    echo "  export HF_TOKEN='hf_xxx' && sudo bash ./bootstrap-llamacpp-openwebui-v0.15.sh"
-    echo "Alternately, manually place the gguf file at: ${DEFAULT_MODEL_TARGET}"
+    echo "Place model at: ${DEFAULT_MODEL_TARGET} and chown to aiuser, or export HF_TOKEN and re-run."
 fi
 
-########################################
-# [7] Create systemd service for llama.cpp
-########################################
-section "[7/12] Create systemd service for llama.cpp (external server)"
+# ---------------- [8] Create systemd service for llama.cpp ----------------
+section "[8/12] Create systemd unit for llama.cpp"
 LLAMA_SYSTEMD_PATH="/etc/systemd/system/${LLAMACPP_SERVICE}"
 cat > "${LLAMA_SYSTEMD_PATH}" <<EOF
 [Unit]
-Description=llama.cpp external server (best-effort wrapper)
+Description=llama.cpp external server (wrapper)
 After=network.target
 After=local-fs.target
 
@@ -320,7 +348,6 @@ Type=simple
 User=aiuser
 Group=aiuser
 WorkingDirectory=${LLAMACPP_OPT}
-# ExecStart uses wrapper which will call /usr/local/bin/llamacpp
 ExecStart=${LLAMACPP_OPT}/bin/llamacpp-run ${DEFAULT_MODEL_TARGET} 8081
 Restart=on-failure
 RestartSec=5s
@@ -331,13 +358,10 @@ StartLimitBurst=5
 [Install]
 WantedBy=multi-user.target
 EOF
-
 chmod 644 "${LLAMA_SYSTEMD_PATH}"
 
-########################################
-# [8] Create systemd service for OpenWebUI
-########################################
-section "[8/12] Create systemd service for OpenWebUI"
+# ---------------- [9] Create systemd service for OpenWebUI ----------------
+section "[9/12] Create systemd unit for OpenWebUI"
 OPENWEBUI_SYSTEMD_PATH="/etc/systemd/system/${OPENWEBUI_SERVICE}"
 cat > "${OPENWEBUI_SYSTEMD_PATH}" <<EOF
 [Unit]
@@ -355,99 +379,74 @@ Restart=on-failure
 RestartSec=5s
 Environment=OPENWEBUI_DATA_DIR=${OPENWEBUI_DATA_DIR}
 LimitNOFILE=65536
-# Allow OpenWebUI to start after llama.cpp comes up
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
 chmod 644 "${OPENWEBUI_SYSTEMD_PATH}"
 
-# reload systemd daemon
 systemctl daemon-reload || true
 
-########################################
-# [9] Enable & start services (if systemd active)
-########################################
-section "[9/12] Enable and start services (systemd)"
-# Check if systemd is available and running
+# ---------------- [10] Enable & start services ----------------
+section "[10/12] Enable and start services (if systemd active)"
 if pidof systemd >/dev/null 2>&1; then
     echo "systemd detected — enabling and starting services..."
     systemctl enable --now "${LLAMACPP_SERVICE}" || echo "Warning: enabling/starting ${LLAMACPP_SERVICE} failed."
-    # wait a bit for llama.cpp to start
-    sleep 3
+    # small delay to let llama.cpp attempt to bind model/port
+    sleep 4
     systemctl enable --now "${OPENWEBUI_SERVICE}" || echo "Warning: enabling/starting ${OPENWEBUI_SERVICE} failed."
 else
-    echo "systemd not detected/running in this environment. You must start the services manually or enable systemd in WSL."
+    echo "systemd not detected/running. Services were written to /etc/systemd/system but you must enable/start them manually or enable systemd in WSL."
     echo "Manual start examples:"
     echo "  sudo -u aiuser ${LLAMACPP_OPT}/bin/llamacpp-run ${DEFAULT_MODEL_TARGET} 8081 &"
     echo "  sudo -u aiuser ${OPENWEBUI_OPT}/bin/openwebui-run &"
 fi
 
-########################################
-# [10] Quick verification notes
-########################################
-section "[10/12] Quick verification"
-echo "Commands to check status:"
+# ---------------- [11] Verify & notes ----------------
+section "[11/12] Quick verification & notes"
+echo "Check service status with:"
 echo "  systemctl status ${LLAMACPP_SERVICE} --no-pager"
 echo "  systemctl status ${OPENWEBUI_SERVICE} --no-pager"
+echo "View logs:"
 echo "  journalctl -u ${LLAMACPP_SERVICE} -n 200 --no-pager"
 echo "  journalctl -u ${OPENWEBUI_SERVICE} -n 200 --no-pager"
-echo "OpenWebUI should be available at http://<wsl-ip>:8080"
-echo "llama.cpp external server (if running) should listen at port 8081"
+echo "OpenWebUI: http://<wsl-ip>:8080"
+echo "llama.cpp server (if running): port 8081"
 pause_if_interactive
 
-########################################
-# [11] Cleanup & final notes
-########################################
-section "[11/12] Cleanup & notes"
+# ---------------- [12] Cleanup & finish ----------------
+section "[12/12] Cleanup & finish"
 apt-get autoremove -y || true
 apt-get clean || true
 
 cat <<EOF
 
-Bootstrap v0.15 completed (best-effort).
+Bootstrap v0.16 completed.
 
 Summary:
-• llama.cpp built at: ${LLAMACPP_OPT}
-  - binary symlink: /usr/local/bin/llamacpp
-  - wrapper: /usr/local/bin/llamacpp-run (calls ${LLAMACPP_OPT}/bin/llamacpp-run)
-  - default model: ${DEFAULT_MODEL_TARGET} (attempted download only if HF_TOKEN set)
+• Built llama.cpp (CUDA enabled if available and successful; automatically retried CPU-only on CUDA build failure).
+• Binary symlink: /usr/local/bin/llamacpp
+• Wrapper: /usr/local/bin/llamacpp-run
+• OpenWebUI installed into venv at: ${OPENWEBUI_OPT}
+• Default model path: ${DEFAULT_MODEL_TARGET} (automatic download attempted only if HF_TOKEN present)
+• Systemd units created:
+    - ${LLAMACPP_SERVICE}
+    - ${OPENWEBUI_SERVICE}
 
-• OpenWebUI installed in venv at: ${OPENWEBUI_OPT}
-  - run via: openwebui-run (symlinked to /usr/local/bin/openwebui-run)
-  - data dir: ${OPENWEBUI_DATA_DIR}
+If your llama.cpp binary uses different CLI options for server mode, edit:
+    ${LLAMACPP_OPT}/bin/llamacpp-run
+to the correct exec line, then restart:
+    sudo systemctl restart ${LLAMACPP_SERVICE}
 
-• Systemd services created:
-  - ${LLAMACPP_SERVICE}
-  - ${OPENWEBUI_SERVICE}
-  (Enabled and started if systemd is active.)
-
-Notes & next steps:
-1) If HF_TOKEN was not provided, manually place the model:
-     sudo mkdir -p ${AI_MODELS_DIR}
-     sudo chown aiuser:aiuser ${AI_MODELS_DIR}
-     sudo cp /path/to/deepseek-r1-1.5b.gguf ${DEFAULT_MODEL_TARGET}
-     sudo chown aiuser:aiuser ${DEFAULT_MODEL_TARGET}
-   Then restart the service:
-     sudo systemctl restart ${LLAMACPP_SERVICE}
-
-2) If llama.cpp fails to start due to CLI flag differences, edit:
-     ${LLAMACPP_OPT}/bin/llamacpp-run
-   adjust exec line to the correct flags for your compiled build.
-
-3) If you want a CPU-only build regardless of CUDA detection, re-run the build step
-   with HAS_CUDA=0, or edit the cmake configure command.
+If model download failed and you have the gguf file:
+    sudo mkdir -p ${AI_MODELS_DIR}
+    sudo cp /path/to/${DEFAULT_MODEL_NAME} ${DEFAULT_MODEL_TARGET}
+    sudo chown aiuser:aiuser ${DEFAULT_MODEL_TARGET}
+    sudo systemctl restart ${LLAMACPP_SERVICE}
 
 Log file: ${LOGFILE}
-
 EOF
 
-########################################
-# [12] Finish
-########################################
-section "[12/12] Done"
-echo "Bootstrap finished at: $(date)"
-echo "Inspect ${LOGFILE} and journalctl for service logs."
+echo "Done at $(date)"

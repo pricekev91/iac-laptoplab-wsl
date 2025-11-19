@@ -1,174 +1,176 @@
 #!/usr/bin/env bash
-# ==============================================================
-# Bootstrap: llama.cpp + OpenWebUI (v0.17a)
-# - Detect NVIDIA/CUDA
-# - Auto CPU fallback
-# - Systemd services
-# - WSL2/Ubuntu safe Python venv for OpenWebUI
-# ==============================================================
+# bootstrap-llamacpp-openwebui.sh — Version 0.18
+# Purpose: Install llama.cpp + OpenWebUI with optional CUDA GPU acceleration
+# Author: Kevin Price
+# Changelog:
+#   v0.18 - Added CUDA toolkit auto-install, systemd service setup, improved GPU detection
 
 set -euo pipefail
+IFS=$'\n\t'
 
-# ------------------------ Variables --------------------------
-LLAMACPP_REPO="https://github.com/ggerganov/llama.cpp.git"
-LLAMACPP_OPT="/opt/llama.cpp"
-OPENWEBUI_REPO="https://github.com/openwebui/openwebui.git"
-OPENWEBUI_OPT="/opt/openwebui"
-SERVICE_USER="aiuser"
+LOGFILE="/root/bootstrap-llamacpp.log"
 AUTO=${AUTO:-0}
 
-# ------------------------ Helper -----------------------------
+echo "=============================================================="
+echo " Bootstrap: llama.cpp + OpenWebUI (v0.18)"
+echo "=============================================================="
+echo "Logfile: $LOGFILE"
+echo ""
+
 pause() {
-    if [ "$AUTO" -ne 1 ]; then
-        read -rp "⏸ Press ENTER to continue (or set AUTO=1 to skip)..."
-    fi
+  if [[ "$AUTO" -eq 0 ]]; then
+    read -rp "⏸  Press ENTER to continue (or set AUTO=1 to skip)..."
+  fi
 }
 
-section() {
-    echo
-    echo "=============================================================="
-    echo " $1"
-    echo "=============================================================="
-}
-
-# ------------------------ 0. Prepare dirs & user -------------------
-section "[0/12] Preparing directories and service user"
-if ! id "$SERVICE_USER" >/dev/null 2>&1; then
-    useradd -m -s /bin/bash "$SERVICE_USER"
-    echo "Created system user: $SERVICE_USER"
-fi
+echo "Starting bootstrap..."
 pause
 
-# ------------------------ 1. Update & install packages -------------------
-section "[1/12] Update & install build/runtime packages"
-apt update && apt upgrade -y
-apt install -y git build-essential cmake ninja-build python3 python3-pip python3-venv wget curl lsb-release software-properties-common
+# ========================
+# [0/12] Prepare directories and user
+# ========================
+echo "Creating directories and service user..."
+mkdir -p /opt/llama.cpp /opt/openwebui /srv/llama/models
+useradd -m -s /bin/bash aiuser || true
 pause
 
-# ------------------------ 2. Detect NVIDIA/CUDA -------------------
-section "[2/12] NVIDIA/CUDA detection"
-HAS_CUDA=0
-if command -v nvidia-smi >/dev/null 2>&1; then
-    echo "NVIDIA GPU detected: $(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)"
-    if nvidia-smi >/dev/null 2>&1; then
-        HAS_CUDA=1
-        echo "CUDA toolkit detected: $(nvcc --version 2>/dev/null || echo 0)"
+# ========================
+# [1/12] Update & install build/runtime packages
+# ========================
+echo "[INFO] Installing prerequisites..."
+apt update
+apt install -y \
+  build-essential cmake git wget curl unzip python3 python3-pip python3-venv \
+  ffmpeg libglib2.0-0 libsm6 libxext6 libxrender-dev
+pause
+
+# ========================
+# [2/12] NVIDIA/CUDA detection
+# ========================
+echo "[INFO] Detecting NVIDIA GPU..."
+GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l || echo 0)
+if [[ "$GPU_COUNT" -gt 0 ]]; then
+    echo "NVIDIA GPU detected: $GPU_COUNT"
+    if ! command -v nvcc &>/dev/null; then
+        echo "CUDA toolkit not found. Installing..."
+        apt install -y nvidia-cuda-toolkit
     fi
+    echo "CUDA version:"
+    nvcc --version
+    BUILD_MODE="cuda"
 else
-    echo "No NVIDIA GPU detected, will use CPU build"
+    echo "No NVIDIA GPU detected. Falling back to CPU-only mode."
+    BUILD_MODE="cpu"
 fi
 pause
 
-# ------------------------ 3. Clone llama.cpp -------------------
-section "[3/12] Clone & prepare llama.cpp source"
-rm -rf "$LLAMACPP_OPT"
-git clone --branch master "$LLAMACPP_REPO" "$LLAMACPP_OPT"
+# ========================
+# [3/12] Clone llama.cpp
+# ========================
+echo "[INFO] Cloning llama.cpp repository..."
+if [[ ! -d /opt/llama.cpp/.git ]]; then
+    git clone --branch master https://github.com/ggerganov/llama.cpp.git /opt/llama.cpp
+else
+    echo "Repository already exists. Pulling latest..."
+    cd /opt/llama.cpp && git fetch && git reset --hard origin/master
+fi
 pause
 
-# ------------------------ 4. Build llama.cpp -------------------
-section "[4/12] Build llama.cpp (CUDA if available, else CPU). Auto-retry CPU on failure"
-cd "$LLAMACPP_OPT"
+# ========================
+# [4/12] Build llama.cpp
+# ========================
+echo "[INFO] Building llama.cpp ($BUILD_MODE mode)..."
+cd /opt/llama.cpp
 mkdir -p build
 cd build
+set +e
+cmake -DCMAKE_BUILD_TYPE=Release -DLLAMA_CUBLAS=OFF -DGGML_CUDA=$( [[ "$BUILD_MODE" == "cuda" ]] && echo "ON" || echo "OFF" ) ..
+cmake --build . -j$(nproc)
+BUILD_STATUS=$?
+set -e
 
-build_llama() {
-    local mode="$1"
-    echo "Configuring llama.cpp build (mode=${mode})"
-    if [ "$mode" = "cuda" ]; then
-        cmake -S .. -B . -G Ninja -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release || return 1
-    else
-        cmake -S .. -B . -G Ninja -DCMAKE_BUILD_TYPE=Release || return 1
-    fi
-    echo "Running ninja build..."
-    if ninja -v; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-if [ "$HAS_CUDA" -eq 1 ]; then
-    if ! build_llama "cuda"; then
-        echo "CUDA build failed. Retrying CPU-only build..."
-        build_llama "cpu" || { echo "Both CUDA and CPU builds failed. Exiting."; exit 1; }
-    fi
-else
-    build_llama "cpu" || { echo "CPU build failed. Exiting."; exit 1; }
+if [[ "$BUILD_STATUS" -ne 0 && "$BUILD_MODE" == "cuda" ]]; then
+    echo "[WARN] CUDA build failed. Retrying CPU-only build..."
+    cmake -DCMAKE_BUILD_TYPE=Release -DLLAMA_CUBLAS=OFF -DGGML_CUDA=OFF ..
+    cmake --build . -j$(nproc)
 fi
 pause
 
-# ------------------------ 5. Clone OpenWebUI -------------------
-section "[5/12] Clone OpenWebUI"
-rm -rf "$OPENWEBUI_OPT"
-git clone "$OPENWEBUI_REPO" "$OPENWEBUI_OPT"
+# ========================
+# [5/12] Clone OpenWebUI
+# ========================
+echo "[INFO] Cloning OpenWebUI..."
+if [[ ! -d /opt/openwebui/.git ]]; then
+    git clone https://github.com/suno-ai/openwebui.git /opt/openwebui
+else
+    echo "OpenWebUI repo exists. Pulling latest..."
+    cd /opt/openwebui && git fetch && git reset --hard origin/main
+fi
 pause
 
-# ------------------------ 6. Setup Python venv for OpenWebUI -------------------
-section "[6/12] Python virtual environment for OpenWebUI"
-sudo -u $SERVICE_USER python3 -m venv "$OPENWEBUI_OPT/venv"
-sudo -u $SERVICE_USER "$OPENWEBUI_OPT/venv/bin/pip" install --upgrade pip setuptools wheel
-sudo -u $SERVICE_USER "$OPENWEBUI_OPT/venv/bin/pip" install -r "$OPENWEBUI_OPT/requirements.txt"
+# ========================
+# [6/12] Python environment for OpenWebUI
+# ========================
+echo "[INFO] Creating Python virtual environment for OpenWebUI..."
+python3 -m venv /opt/openwebui/venv
+source /opt/openwebui/venv/bin/activate
+pip install --upgrade pip
+pip install -r /opt/openwebui/requirements.txt
+deactivate
 pause
 
-# ------------------------ 7. Setup systemd services -------------------
-section "[7/12] Setup systemd services"
+# ========================
+# [7/12] Setup systemd services
+# ========================
+echo "[INFO] Setting up systemd services..."
 
-# llama.cpp service
-cat <<EOF >/etc/systemd/system/llamacpp.service
+cat >/etc/systemd/system/llamacpp.service <<'EOF'
 [Unit]
 Description=llama.cpp Server
 After=network.target
 
 [Service]
 Type=simple
-User=$SERVICE_USER
-ExecStart=$LLAMACPP_OPT/build/main -m /srv/llama.cpp/models
-Restart=always
-WorkingDirectory=$LLAMACPP_OPT
+User=aiuser
+WorkingDirectory=/opt/llama.cpp
+ExecStart=/opt/llama.cpp/build/main -m /srv/llama/models
+Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# OpenWebUI service
-cat <<EOF >/etc/systemd/system/openwebui.service
+cat >/etc/systemd/system/openwebui.service <<'EOF'
 [Unit]
 Description=OpenWebUI
 After=network.target llamacpp.service
 
 [Service]
 Type=simple
-User=$SERVICE_USER
-ExecStart=$OPENWEBUI_OPT/venv/bin/python $OPENWEBUI_OPT/start-webui.py --host 0.0.0.0 --port 8080
-Restart=always
-WorkingDirectory=$OPENWEBUI_OPT
+User=aiuser
+WorkingDirectory=/opt/openwebui
+ExecStart=/opt/openwebui/venv/bin/python main.py --host 0.0.0.0 --port 8080
+Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable llamacpp.service
-systemctl enable openwebui.service
+systemctl enable llamacpp
+systemctl enable openwebui
 pause
 
-# ------------------------ 8. Setup model directory -------------------
-section "[8/12] Create model directory"
-mkdir -p /srv/llama.cpp/models
-chown -R $SERVICE_USER:$SERVICE_USER /srv/llama.cpp
-pause
-
-# ------------------------ 9. Firewall hints -------------------
-section "[9/12] Firewall (optional)"
-echo "Make sure ports 8080 (OpenWebUI) and any llama.cpp server ports are open."
-pause
-
-# ------------------------ 10. Summary -------------------
-section "[10/12] Bootstrap completed"
-echo "llama.cpp and OpenWebUI installed."
-echo "Systemd services:"
+# ========================
+# [8/12] Final notes
+# ========================
+echo "=============================================================="
+echo "[INFO] Bootstrap complete. You can start services with:"
 echo "  sudo systemctl start llamacpp"
 echo "  sudo systemctl start openwebui"
-echo "Models directory: /srv/llama.cpp/models"
-echo "OpenWebUI: http://<host>:8080"
+echo ""
+echo "[INFO] Check logs with:"
+echo "  sudo journalctl -u llamacpp -f"
+echo "  sudo journalctl -u openwebui -f"
+echo "=============================================================="
 pause

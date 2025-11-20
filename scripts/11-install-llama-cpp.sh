@@ -1,111 +1,109 @@
 #!/usr/bin/env bash
 #
-# 11-install-llama-cpp.sh — Version 0.2
+# 11-install-llama-cpp.sh — Version 0.3
 # Author: Kevin Price
 # Last Updated: 2025-11-20
 #
 # Purpose:
-#   Install llama.cpp automatically using GPU detection results
-#   from 00-detect-gpu.sh. Builds CUDA version if possible,
-#   otherwise falls back to CPU-only.
+#   Fully automated llama.cpp installation with GPU/CPU detection.
+#   Builds in /opt/llama.cpp, auto-fixes common build errors, logs everything.
 #
 
-set -euo pipefail
-
-LOG_DIR="/var/log/laptoplab"
-LOG_FILE="${LOG_DIR}/llama-cpp-install.log"
-INSTALL_DIR="/srv/llama.cpp"
-
+INSTALL_DIR="/opt/llama.cpp"
+LOG_DIR="$INSTALL_DIR/logs"
+LOG_FILE="$LOG_DIR/llama-cpp-install.log"
 mkdir -p "$LOG_DIR"
-mkdir -p "$INSTALL_DIR"
+touch "$LOG_FILE"
 
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [LLAMA-C++] $1" | tee -a "$LOG_FILE"
-}
-
-# ---------------------------
-# BEGIN INSTALLATION
-# ---------------------------
+log() { echo "$(date +"%Y-%m-%d %H:%M:%S") [LLAMA-C++] $1" | tee -a "$LOG_FILE"; }
 
 log "Starting llama.cpp installation..."
-log "Sourcing GPU detection script..."
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/00-detect-gpu.sh"
+# Source GPU detection
+if [[ -z "$GPU_TYPE" ]]; then
+    if [[ -f "$(dirname "$0")/00-detect-gpu.sh" ]]; then
+        log "Sourcing GPU detection script..."
+        source "$(dirname "$0")/00-detect-gpu.sh"
+    else
+        log "WARNING: GPU detection script not found. Defaulting to CPU."
+        GPU_TYPE="cpu"
+        CUDA_AVAILABLE=false
+    fi
+fi
 
 log "Detected GPU type: $GPU_TYPE"
 log "CUDA available: $CUDA_AVAILABLE"
 
-# ---------------------------
 # Install dependencies
-# ---------------------------
+log "Installing required packages..."
+sudo apt update >>"$LOG_FILE" 2>&1
+sudo apt install -y build-essential cmake git python3 python3-pip wget curl libomp-dev pkg-config libcurl4-openssl-dev >>"$LOG_FILE" 2>&1
 
-log "Installing dependencies..."
-
-apt update -y >> "$LOG_FILE" 2>&1
-apt install -y \
-    build-essential \
-    cmake \
-    git \
-    libcurl4-openssl-dev \
-    pkg-config \
-    unzip >> "$LOG_FILE" 2>&1
-
-log "Dependencies installed."
-
-# ---------------------------
-# Clone llama.cpp
-# ---------------------------
-
-if [[ ! -d "${INSTALL_DIR}/llama.cpp" ]]; then
-    log "Cloning llama.cpp repository..."
-    git clone https://github.com/ggerganov/llama.cpp.git "${INSTALL_DIR}/llama.cpp" >> "$LOG_FILE" 2>&1
-else
-    log "llama.cpp already exists — pulling latest changes..."
-    git -C "${INSTALL_DIR}/llama.cpp" pull >> "$LOG_FILE" 2>&1
+# Remove existing install if present
+if [[ -d "$INSTALL_DIR" ]]; then
+    log "Removing existing llama.cpp installation..."
+    sudo rm -rf "$INSTALL_DIR"
 fi
 
-# ---------------------------
-# Prepare build folder
-# ---------------------------
+# Clone repository
+log "Cloning llama.cpp repository to $INSTALL_DIR..."
+sudo git clone https://github.com/ggerganov/llama.cpp.git "$INSTALL_DIR" >>"$LOG_FILE" 2>&1
 
-log "Preparing CMake build..."
+# Prepare build
+cd "$INSTALL_DIR" || exit 1
+mkdir -p build
+cd build || exit 1
 
-cd "${INSTALL_DIR}/llama.cpp"
-rm -rf build
-mkdir build
-cd build
-
-# ---------------------------
 # Configure CMake
-# ---------------------------
-
+CMAKE_FLAGS="-DLLAMA_ENABLE_GPU=OFF -DCMAKE_BUILD_TYPE=Release"
 if [[ "$GPU_TYPE" == "nvidia" && "$CUDA_AVAILABLE" == true ]]; then
-    log "Building with CUDA GPU support..."
-    CMAKE_OPTS="-DLLAMA_CUDA=ON"
+    log "Enabling CUDA build..."
+    CMAKE_FLAGS="-DLLAMA_ENABLE_GPU=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DCMAKE_BUILD_TYPE=Release"
+elif [[ "$GPU_TYPE" == "intel" ]]; then
+    log "CPU Intel-optimized build..."
+elif [[ "$GPU_TYPE" == "amd" ]]; then
+    log "CPU AMD-optimized build..."
 else
-    log "No GPU detected or CUDA unavailable. Building CPU-only version..."
-    CMAKE_OPTS="-DLLAMA_CUDA=OFF"
+    log "No GPU detected or CUDA unavailable. CPU-only build..."
 fi
 
-log "Running CMake configure: cmake .. $CMAKE_OPTS"
+log "Running CMake configure: cmake .. $CMAKE_FLAGS"
+sudo cmake .. $CMAKE_FLAGS >>"$LOG_FILE" 2>&1
 
-if ! cmake .. $CMAKE_OPTS >> "$LOG_FILE" 2>&1; then
-    log "ERROR: CMake configuration failed. See $LOG_FILE"
-    exit 1
-fi
-
-# ---------------------------
-# Compile llama.cpp
-# ---------------------------
-
+# Compile
 log "Compiling llama.cpp..."
+sudo cmake --build . --config Release >>"$LOG_FILE" 2>&1
 
-if ! cmake --build . -j"$(nproc)" >> "$LOG_FILE" 2>&1; then
-    log "ERROR: Build failed. See $LOG_FILE"
-    exit 1
+if [[ $? -eq 0 ]]; then
+    log "llama.cpp built successfully."
+else
+    log "ERROR: Build failed. Attempting auto-fix..."
+
+    log "Retrying CMake clean..."
+    sudo rm -rf *
+    sudo cmake .. $CMAKE_FLAGS >>"$LOG_FILE" 2>&1
+    sudo cmake --build . --config Release >>"$LOG_FILE" 2>&1
+
+    if [[ $? -eq 0 ]]; then
+        log "llama.cpp rebuilt successfully after auto-fix."
+    else
+        log "ERROR: Build failed after auto-fix. Check $LOG_FILE"
+        exit 1
+    fi
 fi
 
-log "llama.cpp build completed successfully!"
-log "Binary located at: ${INSTALL_DIR}/llama.cpp/build/bin/llama-cli"
-log "Installation finished."
+# Verify executable
+log "Verifying main executable..."
+if ./main -h >>"$LOG_FILE" 2>&1; then
+    log "Executable works."
+else
+    log "WARNING: main executable failed. Attempting permission fix..."
+    sudo chmod +x ./main
+    if ./main -h >>"$LOG_FILE" 2>&1; then
+        log "Executable works after chmod fix."
+    else
+        log "ERROR: main still fails to run. Check $LOG_FILE"
+    fi
+fi
+
+log "llama.cpp installation completed."

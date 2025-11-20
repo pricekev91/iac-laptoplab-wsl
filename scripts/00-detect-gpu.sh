@@ -1,63 +1,96 @@
 #!/usr/bin/env bash
 #
-# 00-detect-gpu.sh — Version 0.1
+# 11-install-llama-cpp.sh — Version 0.1
 # Author: Kevin Price
 # Last Updated: 2025-11-20
 #
 # Purpose:
-#   Automatically detect GPU type and CUDA availability.
-#   Sets:
-#     GPU_TYPE       = "nvidia", "intel", "amd", or "cpu"
-#     CUDA_AVAILABLE = true/false
+#   Install and build llama.cpp for CPU or GPU based on detection script.
+#
+# Changelog:
+#   v0.1 — Initial CMake-based build script, hands-off, live logging.
 #
 
-GPU_TYPE="cpu"
-CUDA_AVAILABLE=false
+LOG_DIR="/var/log/laptoplab"
+LOG_FILE="$LOG_DIR/llama-cpp-install.log"
+mkdir -p "$LOG_DIR"
+touch "$LOG_FILE"
 
-# Detect NVIDIA GPU
-if command -v nvidia-smi >/dev/null 2>&1; then
-    NVIDIA_COUNT=$(nvidia-smi -L 2>/dev/null | wc -l)
-    if [[ $NVIDIA_COUNT -gt 0 ]]; then
-        GPU_TYPE="nvidia"
-        # Check if CUDA is installed
-        if command -v nvcc >/dev/null 2>&1; then
-            CUDA_AVAILABLE=true
-        else
-            CUDA_AVAILABLE=false
-        fi
+log() { echo "$(date +"%Y-%m-%d %H:%M:%S") [LLAMA-C++] $1" | tee -a "$LOG_FILE"; }
+
+log "Starting llama.cpp installation..."
+
+# Source GPU detection
+if [[ -z "$GPU_TYPE" ]]; then
+    if [[ -f "$(dirname "$0")/00-detect-gpu.sh" ]]; then
+        log "Sourcing GPU detection script..."
+        source "$(dirname "$0")/00-detect-gpu.sh"
+    else
+        log "WARNING: GPU detection script not found. Defaulting to CPU."
+        GPU_TYPE="cpu"
+        CUDA_AVAILABLE=false
     fi
 fi
 
-# Detect Intel GPU (primarily integrated graphics)
-if [[ "$GPU_TYPE" == "cpu" ]] && command -v lspci >/dev/null 2>&1; then
-    if lspci | grep -i 'intel.*graphics' >/dev/null 2>&1; then
-        GPU_TYPE="intel"
-    fi
+log "Detected GPU type: $GPU_TYPE"
+log "CUDA available: $CUDA_AVAILABLE"
+
+# Install dependencies
+log "Installing required packages..."
+sudo apt update
+sudo apt install -y build-essential cmake git python3 python3-pip wget curl libomp-dev pkg-config >>"$LOG_FILE" 2>&1
+
+# Directory for llama.cpp
+LLAMA_DIR="$HOME/llama.cpp"
+if [[ -d "$LLAMA_DIR" ]]; then
+    log "Removing existing llama.cpp directory..."
+    rm -rf "$LLAMA_DIR"
 fi
 
-# Detect AMD GPU
-if [[ "$GPU_TYPE" == "cpu" ]] && command -v lspci >/dev/null 2>&1; then
-    if lspci | grep -i 'amd.*vga\|radeon\|vega' >/dev/null 2>&1; then
-        GPU_TYPE="amd"
-    fi
-fi
+log "Cloning llama.cpp repository..."
+git clone https://github.com/ggerganov/llama.cpp.git "$LLAMA_DIR" >>"$LOG_FILE" 2>&1
+cd "$LLAMA_DIR" || exit 1
 
-# Environment check for WSL
-if grep -qi microsoft /proc/version 2>/dev/null; then
-    WSL_DETECTED=true
+# Prepare CMake build
+log "Preparing CMake build..."
+mkdir -p build
+cd build || exit 1
+
+# Configure build flags
+CMAKE_FLAGS="-DLLAMA_ENABLE_GPU=OFF"
+if [[ "$GPU_TYPE" == "nvidia" && "$CUDA_AVAILABLE" == true ]]; then
+    log "Building llama.cpp with CUDA support..."
+    CMAKE_FLAGS="-DLLAMA_ENABLE_GPU=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc"
+elif [[ "$GPU_TYPE" == "intel" ]]; then
+    log "Building llama.cpp for CPU (Intel optimized)..."
+elif [[ "$GPU_TYPE" == "amd" ]]; then
+    log "Building llama.cpp for CPU (AMD optimized)..."
 else
-    WSL_DETECTED=false
+    log "No GPU detected or CUDA unavailable. Building CPU-only version..."
 fi
 
-# Summary
-echo "-------------------------------------"
-echo "[GPU-DETECT] GPU detection complete:"
-echo "[GPU-DETECT]   GPU_TYPE:       $GPU_TYPE"
-echo "[GPU-DETECT]   CUDA_AVAILABLE: $CUDA_AVAILABLE"
-echo "[GPU-DETECT]   WSL_DETECTED:   $WSL_DETECTED"
-echo "-------------------------------------"
+# Run CMake configuration
+log "Running CMake configure: cmake .. $CMAKE_FLAGS"
+cmake .. $CMAKE_FLAGS >>"$LOG_FILE" 2>&1
 
-# Export variables so sourcing script can use them
-export GPU_TYPE
-export CUDA_AVAILABLE
-export WSL_DETECTED
+# Compile
+log "Compiling..."
+cmake --build . --config Release >>"$LOG_FILE" 2>&1
+
+if [[ $? -eq 0 ]]; then
+    log "llama.cpp built successfully."
+else
+    log "ERROR: Build failed. Check log file $LOG_FILE."
+    exit 1
+fi
+
+# Optional: Verify build
+log "Verifying build..."
+./main -h >>"$LOG_FILE" 2>&1
+if [[ $? -eq 0 ]]; then
+    log "llama.cpp main executable works."
+else
+    log "WARNING: main executable failed to run."
+fi
+
+log "llama.cpp installation completed."

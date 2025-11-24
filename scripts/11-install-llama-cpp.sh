@@ -1,139 +1,165 @@
 #!/usr/bin/env bash
 #
-# 11-install-llama-cpp.sh — Version 0.461
+# Llama.cpp + OpenWebUI Installer — Version v0.462
 # Author: Kevin Price
 # Updated: 2025-11-24
 #
-# Purpose:
-#   Safe, repeatable llama.cpp installer with:
-#   - GPU/CPU auto-detection
-#   - Automatic build (CUDA → CPU fallback)
-#   - HuggingFace model downloader
-#   - Systemd service generator (optional)
-#   - Logging, retries, and error handling
-#
+# RAW OUTPUT version — no suppressed build logs.
 
-set -euo pipefail
+set -e
 
-VERSION="0.461"
-INSTALL_DIR="/opt/llama.cpp"
-LOG_FILE="/opt/llama-cpp-install.log"
-MODEL_DIR="$INSTALL_DIR/models"
-MODEL_NAME="Meta-Llama-3-8B-Instruct.Q4_0.gguf"
+INSTALL_DIR="/srv/ai"
+LLAMA_DIR="${INSTALL_DIR}/llama.cpp"
+MODEL_DIR="${INSTALL_DIR}/models"
 MODEL_URL="https://huggingface.co/QuantFactory/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct.Q4_0.gguf"
+MODEL_FILE="Meta-Llama-3-8B-Instruct.Q4_0.gguf"
 
-echo "===== llama.cpp Installer v${VERSION} =====" | tee "$LOG_FILE"
+echo "=== Llama.cpp Bootstrap v0.462 ==="
+echo "Running on: $(uname -a)"
+echo ""
 
-log() {
-    echo "$(date +"%Y-%m-%d %H:%M:%S") [LLAMA-INSTALL] $*" | tee -a "$LOG_FILE"
-}
+###############################################
+# Ensure sudo exists (WSL often missing sudo)
+###############################################
+if ! command -v sudo >/dev/null 2>&1; then
+    echo "[WSL] sudo not found. Installing minimal sudo..."
+    apt update && apt install -y sudo
+fi
 
-#############################################
-# 1) Create directories
-#############################################
-log "Creating directories..."
-mkdir -p "$INSTALL_DIR" "$MODEL_DIR"
+###############################################
+# Install dependencies
+###############################################
+echo "=== Installing Dependencies ==="
+sudo apt update
+sudo apt install -y \
+    git cmake build-essential python3 python3-pip \
+    python3-venv curl unzip wget
 
-#############################################
-# 2) Install dependencies
-#############################################
-log "Installing dependencies..."
-apt update -y >>"$LOG_FILE" 2>&1
-apt install -y git build-essential cmake curl wget >>"$LOG_FILE" 2>&1
+###############################################
+# Prepare folder structure
+###############################################
+sudo mkdir -p "${INSTALL_DIR}"
+sudo mkdir -p "${MODEL_DIR}"
+sudo chown -R $USER:$USER "${INSTALL_DIR}"
 
-#############################################
-# 3) Clone llama.cpp (cleanly)
-#############################################
-if [ -d "$INSTALL_DIR/.git" ]; then
-    log "Updating existing llama.cpp repository..."
-    cd "$INSTALL_DIR"
-    git pull >>"$LOG_FILE" 2>&1
+###############################################
+# Clone or update llama.cpp
+###############################################
+echo "=== Syncing llama.cpp ==="
+
+if [ ! -d "${LLAMA_DIR}" ]; then
+    echo "[Clone] llama.cpp directory not found. Cloning fresh..."
+    git clone https://github.com/ggerganov/llama.cpp.git "${LLAMA_DIR}"
 else
-    log "Cloning llama.cpp repository..."
-    git clone https://github.com/ggerganov/llama.cpp.git "$INSTALL_DIR" >>"$LOG_FILE" 2>&1
-    cd "$INSTALL_DIR"
+    echo "[Update] llama.cpp exists — updating..."
+    cd "${LLAMA_DIR}"
+    git reset --hard
+    git pull --rebase origin master
 fi
 
-#############################################
-# 4) GPU Auto-Detection
-#############################################
-log "Detecting GPU for build mode..."
+###############################################
+# Build llama.cpp (RAW full output)
+###############################################
+echo ""
+echo "=== Building llama.cpp (CUDA, RAW output) ==="
+cd "${LLAMA_DIR}"
+mkdir -p build
+cd build
 
-if command -v nvidia-smi >/dev/null 2>&1; then
-    GPU_MODE="cuda"
-    log "NVIDIA GPU detected → Using CUDA build."
+echo "[CMAKE] Running CMake with CUDA..."
+cmake .. -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+
+echo "[MAKE] Compiling — this will show ALL build lines..."
+make -j"$(nproc)"
+
+###############################################
+# Download model
+###############################################
+cd "${MODEL_DIR}"
+
+if [ ! -f "${MODEL_FILE}" ]; then
+    echo "=== Downloading Model ==="
+    curl -L -o "${MODEL_FILE}" "${MODEL_URL}"
 else
-    GPU_MODE="cpu"
-    log "No NVIDIA GPU → Using CPU-only build."
+    echo "Model already exists: ${MODEL_FILE}"
 fi
 
-#############################################
-# 5) Build llama.cpp
-#############################################
-build_llama() {
-    local MODE="$1"
-    log "Building llama.cpp in mode: $MODE"
+###############################################
+# Install OpenWebUI
+###############################################
+echo "=== Installing OpenWebUI ==="
+cd "${INSTALL_DIR}"
 
-    rm -rf build
-    cmake -B build -DGGML_CUDA=$( [ "$MODE" = "cuda" ] && echo 1 || echo 0 ) >>"$LOG_FILE" 2>&1
-    cmake --build build -j$(nproc) >>"$LOG_FILE" 2>&1
-}
-
-log "Starting llama.cpp build..."
-if [ "$GPU_MODE" = "cuda" ]; then
-    if build_llama "cuda"; then
-        log "CUDA build succeeded."
-    else
-        log "CUDA build failed → Falling back to CPU."
-        build_llama "cpu"
-    fi
+if [ ! -d "openwebui" ]; then
+    git clone https://github.com/open-webui/open-webui.git
 else
-    build_llama "cpu"
+    cd openwebui
+    git pull --rebase
 fi
 
-#############################################
-# 6) Download Model
-#############################################
-log "Downloading model: $MODEL_URL"
-cd "$MODEL_DIR"
+echo "=== Python Venv setup ==="
+cd "${INSTALL_DIR}/openwebui"
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
 
-rm -f "$MODEL_NAME"
+###############################################
+# Systemd services (WSL-safe)
+###############################################
+echo "=== Creating systemd services (WSL-aware) ==="
 
-wget -O "$MODEL_NAME" "$MODEL_URL" >>"$LOG_FILE" 2>&1
+SERVICE1=/etc/systemd/system/llama.service
+SERVICE2=/etc/systemd/system/openwebui.service
 
-if [ $? -ne 0 ]; then
-    log "Model download FAILED."
-    exit 1
-fi
+sudo bash -c "cat > $SERVICE1" <<EOF
+[Unit]
+Description=Llama.cpp Server
+After=network.target
 
-log "Model downloaded: $MODEL_NAME"
+[Service]
+Type=simple
+WorkingDirectory=${LLAMA_DIR}/build/bin
+ExecStart=${LLAMA_DIR}/build/bin/llama-server -m ${MODEL_DIR}/${MODEL_FILE} --port 9999 --n-gpu-layers 999
+Restart=always
 
-#############################################
-# 7) Optional checksum placeholder
-#############################################
-# echo "EXPECTED_SHA256_HERE  $MODEL_NAME" | sha256sum -c -
+[Install]
+WantedBy=multi-user.target
+EOF
 
-#############################################
-# 8) Model test run
-#############################################
-log "Running basic llama.cpp test inference..."
+sudo bash -c "cat > $SERVICE2" <<EOF
+[Unit]
+Description=OpenWebUI
+After=network.target llama.service
 
-cd "$INSTALL_DIR"
+[Service]
+Type=simple
+WorkingDirectory=${INSTALL_DIR}/openwebui
+ExecStart=${INSTALL_DIR}/openwebui/venv/bin/python app.py
+Environment="LLAMA_SERVER=http://localhost:9999"
+Restart=always
 
-./build/bin/llama-cli \
-    --model "$MODEL_DIR/$MODEL_NAME" \
-    --prompt "Hello! This is a test." \
-    --n-predict 32 >>"$LOG_FILE" 2>&1
+[Install]
+WantedBy=multi-user.target
+EOF
 
-if [ $? -eq 0 ]; then
-    log "Test inference completed successfully!"
-else
-    log "Test inference FAILED!"
-    exit 1
-fi
+echo "=== Enabling services (WSL will fake-enable) ==="
+sudo systemctl daemon-reload || true
+sudo systemctl enable llama.service || true
+sudo systemctl enable openwebui.service || true
 
-#############################################
-# 9) Finished
-#############################################
-log "===== llama.cpp Install COMPLETE — Version $VERSION ====="
-echo "Install complete."
+echo ""
+echo "==============================================="
+echo "    Installation Complete - v0.462"
+echo "==============================================="
+echo "llama.cpp model: ${MODEL_DIR}/${MODEL_FILE}"
+echo "OpenWebUI installed at: ${INSTALL_DIR}/openwebui"
+echo ""
+echo "Start manually under WSL with:"
+echo "    systemctl start llama || true"
+echo "    systemctl start openwebui || true"
+echo ""
+echo "Open OpenWebUI in browser:"
+echo "    http://localhost:8080"
+echo ""
+echo "Done."

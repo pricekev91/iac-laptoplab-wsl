@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# 11-install-llama-openwebui.sh — Version 0.42
+# 11-install-llama-openwebui.sh — Version 0.43
 # Author: Kevin Price
-# Updated: 2025-11-23
+# Updated: 2025-11-24
 #
 # Purpose:
 #   Full AI Appliance installer for llama.cpp + OpenWebUI.
@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.42"
+SCRIPT_VERSION="0.43"
 LOG_FILE="/opt/llama-install.log"
 
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -47,19 +47,49 @@ mkdir -p "$MODEL_DIR" "$OPENWEBUI_DIR"
 # System update
 # --------------------------------------------------------
 echo "=== Updating system ==="
-apt update
-apt upgrade -y
-apt autoremove -y
-apt autoclean -y
+apt-get update
+apt-get upgrade -y
+apt-get autoremove -y
+apt-get autoclean -y
 
 # --------------------------------------------------------
 # Install dependencies
 # --------------------------------------------------------
 echo "=== Installing required packages ==="
-apt install -y \
+apt-get install -y \
     build-essential cmake git python3 python3-venv python3-pip \
-    wget curl libomp-dev pkg-config libcurl4-openssl-dev \
-    huggingface-hub
+    wget curl libomp-dev pkg-config libcurl4-openssl-dev
+
+# --------------------------------------------------------
+# Install CUDA runtime (lightweight) if NVIDIA GPU present
+# --------------------------------------------------------
+if command -v nvidia-smi >/dev/null 2>&1; then
+    if ! command -v nvcc >/dev/null 2>&1; then
+        echo "=== Installing CUDA runtime for GPU acceleration ==="
+        
+        # Add NVIDIA CUDA repository
+        wget -q https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb
+        dpkg -i cuda-keyring_1.1-1_all.deb
+        apt-get update
+        
+        # Install CUDA runtime only (not full dev toolkit)
+        apt-get install -y cuda-nvcc-12-6 cuda-cudart-dev-12-6
+        
+        # Set CUDA paths
+        echo 'export PATH=/usr/local/cuda/bin:$PATH' >> "$PROFILE"
+        echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "$PROFILE"
+        export PATH=/usr/local/cuda/bin:$PATH
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+        
+        echo "✓ CUDA runtime installed successfully"
+    else
+        echo "✓ CUDA already installed"
+    fi
+fi
+
+# Install huggingface-hub via pip instead of apt
+echo "=== Installing HuggingFace CLI via pip ==="
+pip3 install --upgrade huggingface-hub[cli]
 
 # --------------------------------------------------------
 # Detect GPU / CUDA
@@ -67,14 +97,23 @@ apt install -y \
 GPU_TYPE="cpu"
 CUDA_AVAILABLE=false
 
+echo "=== Checking for NVIDIA GPU ==="
 if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
+    echo "NVIDIA GPU detected!"
+    
     if [[ -x "/usr/local/cuda/bin/nvcc" ]]; then
         GPU_TYPE="nvidia"
         CUDA_AVAILABLE=true
-        echo "Detected NVIDIA GPU with CUDA available."
+        echo "✓ CUDA toolkit found - will build with GPU acceleration"
     else
-        echo "NVIDIA GPU detected but nvcc missing — CPU build only."
+        echo "⚠ WARNING: NVIDIA GPU found but CUDA toolkit (nvcc) is missing!"
+        echo "Install CUDA toolkit for GPU acceleration:"
+        echo "  https://developer.nvidia.com/cuda-downloads"
+        echo "Falling back to CPU-only build..."
     fi
+else
+    echo "No NVIDIA GPU detected - building CPU-only version"
 fi
 
 # --------------------------------------------------------
@@ -102,10 +141,10 @@ CMAKE_FLAGS="-DLLAMA_CURL=ON -DCMAKE_BUILD_TYPE=Release"
 
 if [[ "$CUDA_AVAILABLE" == true ]]; then
     echo "Building with CUDA support..."
-    CMAKE_FLAGS="$CMAKE_FLAGS -DLLAMA_ENABLE_GPU=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc"
+    CMAKE_FLAGS="$CMAKE_FLAGS -DLLAMA_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc"
 else
     echo "Building CPU-only version..."
-    CMAKE_FLAGS="$CMAKE_FLAGS -DLLAMA_ENABLE_GPU=OFF"
+    CMAKE_FLAGS="$CMAKE_FLAGS -DLLAMA_CUDA=OFF"
 fi
 
 cmake .. $CMAKE_FLAGS

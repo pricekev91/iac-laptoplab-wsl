@@ -87,9 +87,9 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     fi
 fi
 
-# Install huggingface-hub via pip instead of apt
+# Install huggingface-hub via pip (with --break-system-packages for system-wide CLI tool)
 echo "=== Installing HuggingFace CLI via pip ==="
-pip3 install --upgrade huggingface-hub[cli]
+pip3 install --break-system-packages --upgrade huggingface-hub[cli]
 
 # --------------------------------------------------------
 # Detect GPU / CUDA

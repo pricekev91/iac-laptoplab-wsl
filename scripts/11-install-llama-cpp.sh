@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# 11-install-llama-openwebui.sh — Version 0.43
+# 11-install-llama-openwebui.sh — Version 0.44
 # Author: Kevin Price
 # Updated: 2025-11-24
 #
@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.43"
+SCRIPT_VERSION="0.44"
 LOG_FILE="/opt/llama-install.log"
 
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -63,54 +63,29 @@ apt-get install -y \
 # --------------------------------------------------------
 # Install CUDA runtime (lightweight) if NVIDIA GPU present
 # --------------------------------------------------------
+GPU_TYPE="cpu"
+CUDA_AVAILABLE=false
+
 if command -v nvidia-smi >/dev/null 2>&1; then
+    echo "=== NVIDIA GPU detected ==="
+    nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
     if ! command -v nvcc >/dev/null 2>&1; then
-        echo "=== Installing CUDA runtime for GPU acceleration ==="
-        
-        # Add NVIDIA CUDA repository
+        echo "Installing CUDA runtime..."
         wget -q https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb
         dpkg -i cuda-keyring_1.1-1_all.deb
         apt-get update
-        
-        # Install CUDA runtime only (not full dev toolkit)
         apt-get install -y cuda-nvcc-12-6 cuda-cudart-dev-12-6 libcublas-12-6 libcublas-dev-12-6
-        
-        # Set CUDA paths
         echo 'export PATH=/usr/local/cuda/bin:$PATH' >> "$PROFILE"
         echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}' >> "$PROFILE"
         export PATH=/usr/local/cuda/bin:$PATH
         export LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-        
-        echo "✓ CUDA runtime installed successfully"
-    else
-        echo "✓ CUDA already installed"
     fi
-fi
-
-# Install huggingface-hub via pip (with --break-system-packages for system-wide CLI tool)
-echo "=== Installing HuggingFace CLI via pip ==="
-pip3 install --break-system-packages --upgrade huggingface-hub[cli]
-
-# --------------------------------------------------------
-# Detect GPU / CUDA
-# --------------------------------------------------------
-GPU_TYPE="cpu"
-CUDA_AVAILABLE=false
-
-echo "=== Checking for NVIDIA GPU ==="
-if command -v nvidia-smi >/dev/null 2>&1; then
-    nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
-    echo "NVIDIA GPU detected!"
-    
     if [[ -x "/usr/local/cuda/bin/nvcc" ]]; then
         GPU_TYPE="nvidia"
         CUDA_AVAILABLE=true
         echo "✓ CUDA toolkit found - will build with GPU acceleration"
     else
-        echo "⚠ WARNING: NVIDIA GPU found but CUDA toolkit (nvcc) is missing!"
-        echo "Install CUDA toolkit for GPU acceleration:"
-        echo "  https://developer.nvidia.com/cuda-downloads"
-        echo "Falling back to CPU-only build..."
+        echo "⚠ CUDA toolkit missing. Falling back to CPU build"
     fi
 else
     echo "No NVIDIA GPU detected - building CPU-only version"
@@ -163,14 +138,24 @@ ln -sf "$INSTALL_DIR/build/bin/llama-server" /usr/local/bin/llama-server
 ln -sf "$INSTALL_DIR/build/bin/llama-cli" /usr/local/bin/llama
 
 # --------------------------------------------------------
-# Download model using HuggingFace CLI
+# Install HuggingFace CLI via pip
+# --------------------------------------------------------
+echo "=== Installing HuggingFace CLI ==="
+pip3 install --break-system-packages --upgrade huggingface-hub
+
+# Detect HuggingFace CLI executable
+HF_CLI=$(command -v hf || command -v huggingface || command -v huggingface-cli || true)
+if [[ -z "$HF_CLI" ]]; then
+    echo "ERROR: HuggingFace CLI not found. Install via: pip3 install huggingface-hub"
+    exit 1
+fi
+
+# --------------------------------------------------------
+# Download model
 # --------------------------------------------------------
 echo "=== Checking for model: $MODEL_FILE ==="
-
 if [[ ! -f "$MODEL_FILE" ]]; then
     echo "Model not found. Downloading via HuggingFace CLI..."
-
-    # Export token if provided
     if [[ -n "${HUGGINGFACE_HUB_TOKEN:-}" ]]; then
         export HUGGINGFACE_HUB_TOKEN="${HUGGINGFACE_HUB_TOKEN}"
         echo "Using HuggingFace token."
@@ -178,7 +163,7 @@ if [[ ! -f "$MODEL_FILE" ]]; then
         echo "WARNING: No HuggingFace token set — public models only."
     fi
 
-    huggingface-cli download meta-llama/Meta-Llama-3-8B \
+    $HF_CLI download meta-llama/Meta-Llama-3-8B \
         --include "*.gguf" \
         --local-dir "$MODEL_DIR" \
         --local-dir-use-symlinks False
@@ -214,7 +199,6 @@ deactivate
 # Systemd: llama-server
 # --------------------------------------------------------
 echo "=== Installing llama-server systemd service ==="
-
 cat > /etc/systemd/system/llama-server.service <<EOF
 [Unit]
 Description=llama-server — Llama.cpp inference server
@@ -240,7 +224,6 @@ systemctl enable --now llama-server.service
 # Systemd: OpenWebUI
 # --------------------------------------------------------
 echo "=== Installing OpenWebUI systemd service ==="
-
 cat > /etc/systemd/system/openwebui.service <<EOF
 [Unit]
 Description=OpenWebUI

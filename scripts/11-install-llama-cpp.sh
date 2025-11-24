@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Llama.cpp + OpenWebUI Installer — Version v0.462
+# Llama.cpp + OpenWebUI Installer — Version v0.463
 # Author: Kevin Price
 # Updated: 2025-11-24
 #
@@ -11,6 +11,7 @@ set -e
 INSTALL_DIR="/srv/ai"
 LLAMA_DIR="${INSTALL_DIR}/llama.cpp"
 MODEL_DIR="${INSTALL_DIR}/models"
+OPENWEBUI_DIR="${INSTALL_DIR}/open-webui"
 MODEL_URL="https://huggingface.co/QuantFactory/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct.Q4_0.gguf"
 MODEL_FILE="Meta-Llama-3-8B-Instruct.Q4_0.gguf"
 
@@ -90,15 +91,15 @@ fi
 echo "=== Installing OpenWebUI ==="
 cd "${INSTALL_DIR}"
 
-if [ ! -d "openwebui" ]; then
-    git clone https://github.com/open-webui/open-webui.git
+if [ ! -d "${OPENWEBUI_DIR}" ]; then
+    git clone https://github.com/open-webui/open-webui.git "${OPENWEBUI_DIR}"
 else
-    cd openwebui
+    cd "${OPENWEBUI_DIR}"
     git pull --rebase
 fi
 
 echo "=== Python Venv setup ==="
-cd "${INSTALL_DIR}/openwebui"
+cd "${OPENWEBUI_DIR}"
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
@@ -134,8 +135,8 @@ After=network.target llama.service
 
 [Service]
 Type=simple
-WorkingDirectory=${INSTALL_DIR}/openwebui
-ExecStart=${INSTALL_DIR}/openwebui/venv/bin/python app.py
+WorkingDirectory=${OPENWEBUI_DIR}
+ExecStart=${OPENWEBUI_DIR}/venv/bin/python app.py
 Environment="LLAMA_SERVER=http://localhost:9999"
 Restart=always
 
@@ -153,7 +154,7 @@ echo "==============================================="
 echo "    Installation Complete - v0.462"
 echo "==============================================="
 echo "llama.cpp model: ${MODEL_DIR}/${MODEL_FILE}"
-echo "OpenWebUI installed at: ${INSTALL_DIR}/openwebui"
+echo "OpenWebUI installed at: ${OPENWEBUI_DIR}"
 echo ""
 echo "Start manually under WSL with:"
 echo "    systemctl start llama || true"
